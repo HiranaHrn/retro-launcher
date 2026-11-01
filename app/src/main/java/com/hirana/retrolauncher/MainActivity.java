@@ -33,6 +33,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.AlarmClock;
+import android.provider.CallLog;
 import android.provider.ContactsContract;
 import android.provider.MediaStore;
 import android.provider.Settings;
@@ -59,7 +60,7 @@ import java.util.Set;
 
 public class MainActivity extends Activity implements PhoneView.Host {
 
-    private static final int REQ_CALL = 7, REQ_CONTACTS = 8, REQ_PICK = 100;
+    private static final int REQ_CALL = 7, REQ_CONTACTS = 8, REQ_CALLLOG = 9, REQ_PICK = 100;
 
     private PhoneView view;
     private SharedPreferences sp;
@@ -83,6 +84,10 @@ public class MainActivity extends Activity implements PhoneView.Host {
         sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
         hideStatusBar();
         loadContacts();
+        if (!sp.getBoolean("askedCallLog", false)) {
+            sp.edit().putBoolean("askedCallLog", true).apply();
+            requestPermissions(new String[]{Manifest.permission.READ_CALL_LOG}, REQ_CALLLOG);
+        }
     }
 
     @Override
@@ -262,25 +267,22 @@ public class MainActivity extends Activity implements PhoneView.Host {
             status.location = lm.isLocationEnabled();
         } catch (Exception ignored) {
         }
-        // Bildirimler
-        status.notifAccess = hasNotifAccess();
-        if (status.notifAccess) {
-            status.notif = NotifService.total;
-            status.missed = NotifService.missed;
-            status.sms = NotifService.sms;
-        } else {
-            status.notif = 0;
-            status.missed = 0;
-            status.sms = 0;
-        }
-    }
-
-    private boolean hasNotifAccess() {
-        try {
-            String s = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
-            return s != null && s.contains(getPackageName());
-        } catch (Exception e) {
-            return false;
+        // Cevapsız aramalar (arama kaydından)
+        status.callLogAccess = checkSelfPermission(Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED;
+        status.notif = 0;
+        status.sms = 0;
+        status.missed = 0;
+        if (status.callLogAccess) {
+            try {
+                Cursor c = getContentResolver().query(CallLog.Calls.CONTENT_URI, new String[]{CallLog.Calls._ID},
+                        CallLog.Calls.TYPE + "=" + CallLog.Calls.MISSED_TYPE + " AND " + CallLog.Calls.NEW + "=1",
+                        null, null);
+                if (c != null) {
+                    status.missed = c.getCount();
+                    c.close();
+                }
+            } catch (Exception ignored) {
+            }
         }
     }
 
@@ -424,13 +426,6 @@ public class MainActivity extends Activity implements PhoneView.Host {
                 "com.miui.calculator", "com.android.calculator2");
         addPkgs(whatsapp, "com.whatsapp", "com.whatsapp.w4b");
         addPkgs(youtube, "com.google.android.youtube");
-
-        Set<String> phoneSet = new HashSet<>(phone.pkgs);
-        phoneSet.removeAll(contactsS.pkgs);
-        phoneSet.add("com.samsung.android.dialer");
-        phoneSet.add("com.google.android.dialer");
-        NotifService.phonePkgs = phoneSet;
-        NotifService.smsPkgs = new HashSet<>(messages.pkgs);
 
         Spec[] display = {phone, contactsS, messages, calendar, gallery, camera, music, files, settings,
                 play, internet, maps, gmail, clock, calc, whatsapp, youtube};
@@ -598,11 +593,18 @@ public class MainActivity extends Activity implements PhoneView.Host {
     }
 
     @Override
-    public void openNotifAccess() {
-        try {
-            startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
-        } catch (Exception ignored) {
+    public void requestCallLog() {
+        if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Cevapsız aramalar zaten açık", Toast.LENGTH_SHORT).show();
+            return;
         }
+        if (sp.getBoolean("askedCallLog", false) && !shouldShowRequestPermissionRationale(Manifest.permission.READ_CALL_LOG)) {
+            appInfo(new AppEntry("", new ComponentName(getPackageName(), MainActivity.class.getName())));
+            Toast.makeText(this, "İzinler > Arama kaydı > İzin ver", Toast.LENGTH_LONG).show();
+            return;
+        }
+        sp.edit().putBoolean("askedCallLog", true).apply();
+        requestPermissions(new String[]{Manifest.permission.READ_CALL_LOG}, REQ_CALLLOG);
     }
 
     @Override

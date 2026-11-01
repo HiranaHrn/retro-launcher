@@ -43,7 +43,7 @@ public class PhoneView extends View {
         void launch(AppEntry app);
         void appInfo(AppEntry app);
         void call(String number);
-        void openNotifAccess();
+        void requestCallLog();
         void openHomeSettings();
         void pickContact(int slot);
         void requestContacts();
@@ -63,7 +63,7 @@ public class PhoneView extends View {
 
     public static class Status {
         public int signal, battery = 100, wifi = -1, notif, missed, sms;
-        public boolean charging, bt, data, airplane, mute, vibrate, alarm, headphones, location, notifAccess;
+        public boolean charging, bt, data, airplane, mute, vibrate, alarm, headphones, location, callLogAccess;
         public String operator = "";
         public float lux = -1;
     }
@@ -1012,7 +1012,7 @@ public class PhoneView extends View {
             ls.rows.add(row(bmps.get(o.icon), o.title, o.labels[opt(o)], () -> pushList(l -> buildOptions(l, o))));
         }
         ls.rows.add(row(bmps.get("ic_phone"), "Hızlı arama", null, () -> pushList(this::buildSpeed)));
-        ls.rows.add(row(bmps.get("st_mail"), "Bildirimler", st.notifAccess ? "Açık" : "Kapalı", host::openNotifAccess));
+        ls.rows.add(row(bmps.get("st_missed"), "Cevapsız aramalar", st.callLogAccess ? "Açık" : "Kapalı", host::requestCallLog));
         ls.rows.add(row(bmps.get("ic_apps"), "Ana ekran seçimi", null, host::openHomeSettings));
         ls.rows.add(row(bmps.get("set_info"), "Hakkında", null, () -> showMsg("Retro Launcher " + version())));
     }
