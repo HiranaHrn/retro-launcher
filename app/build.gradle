@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+def runNumber = System.getenv("GITHUB_RUN_NUMBER")
+
+android {
+    namespace 'com.hirana.retrolauncher'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.hirana.retrolauncher'
+        minSdk 28
+        targetSdk 34
+        versionCode runNumber ? runNumber.toInteger() : 1
+        versionName runNumber ? "1.${runNumber}" : "1.0"
+    }
+
+    signingConfigs {
+        fixed {
+            storeFile file('retro.keystore')
+            storePassword 'retro123'
+            keyAlias 'retro'
+            keyPassword 'retro123'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.fixed
+        }
+        debug {
+            signingConfig signingConfigs.fixed
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
