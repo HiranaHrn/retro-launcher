@@ -2,22 +2,38 @@ package com.hirana.retrolauncher;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlarmManager;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
+import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.database.Cursor;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.location.LocationManager;
+import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
-import android.media.ToneGenerator;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.AlarmClock;
+import android.provider.ContactsContract;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.provider.Telephony;
@@ -33,19 +49,27 @@ import android.widget.Toast;
 import java.text.Collator;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 public class MainActivity extends Activity implements PhoneView.Host {
 
-    private static final int REQ_CALL = 7;
+    private static final int REQ_CALL = 7, REQ_CONTACTS = 8, REQ_PICK = 100;
 
     private PhoneView view;
-    private ToneGenerator toneGen;
+    private SharedPreferences sp;
     private String pendingNumber;
+    private int pendingSlot = 0;
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final PhoneView.Status status = new PhoneView.Status();
+    private volatile List<PhoneView.Contact> contacts = new ArrayList<>();
+    private static final Map<String, android.graphics.Bitmap> autoIconCache = new HashMap<>();
+    private SensorManager sensors;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -53,23 +77,27 @@ public class MainActivity extends Activity implements PhoneView.Host {
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         getWindow().setAttributes(lp);
+        sp = getSharedPreferences("retro", MODE_PRIVATE);
         view = new PhoneView(this, this);
         setContentView(view);
-        try {
-            toneGen = new ToneGenerator(AudioManager.STREAM_DTMF, 70);
-        } catch (Exception e) {
-            toneGen = null;
-        }
-        hideBars();
+        sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
+        hideStatusBar();
+        loadContacts();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        hideBars();
+        hideStatusBar();
         loadApps();
         registerReceiver(batteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        handler.post(signalPoll);
+        handler.post(statusPoll);
+        view.setActive(true);
+        try {
+            Sensor light = sensors.getDefaultSensor(Sensor.TYPE_LIGHT);
+            if (light != null) sensors.registerListener(lightListener, light, SensorManager.SENSOR_DELAY_NORMAL);
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
@@ -79,25 +107,24 @@ public class MainActivity extends Activity implements PhoneView.Host {
             unregisterReceiver(batteryReceiver);
         } catch (Exception ignored) {
         }
-        handler.removeCallbacks(signalPoll);
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        if (toneGen != null) toneGen.release();
+        handler.removeCallbacks(statusPoll);
+        view.setActive(false);
+        try {
+            sensors.unregisterListener(lightListener);
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        view.reset();
+        view.goHome();
     }
 
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        if (hasFocus) hideBars();
+        if (hasFocus) hideStatusBar();
     }
 
     @SuppressWarnings("deprecation")
@@ -106,58 +133,158 @@ public class MainActivity extends Activity implements PhoneView.Host {
         view.back();
     }
 
+    /** Sadece üst durum çubuğu gizlenir; alttaki 3 tuş görünür kalır. */
     @SuppressWarnings("deprecation")
-    private void hideBars() {
+    private void hideStatusBar() {
         if (Build.VERSION.SDK_INT >= 30) {
-            getWindow().setDecorFitsSystemWindows(false);
+            getWindow().setDecorFitsSystemWindows(true);
             WindowInsetsController c = getWindow().getInsetsController();
             if (c != null) {
-                c.hide(WindowInsets.Type.systemBars());
+                c.hide(WindowInsets.Type.statusBars());
+                c.show(WindowInsets.Type.navigationBars());
                 c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN);
         }
     }
 
-    // ---------- Pil ve sinyal ----------
+    // ================= Durum bilgileri =================
 
     private final BroadcastReceiver batteryReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
             int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-            if (level < 0 || scale <= 0) return;
-            int pct = level * 100 / scale;
-            int idx = pct < 10 ? 0 : pct < 35 ? 1 : pct < 60 ? 2 : pct < 85 ? 3 : 4;
-            view.setBattery(idx);
+            if (level >= 0 && scale > 0) status.battery = level * 100 / scale;
+            status.charging = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+            view.setStatus(status);
         }
     };
 
-    private final Runnable signalPoll = new Runnable() {
+    private final SensorEventListener lightListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent e) {
+            float lux = e.values[0];
+            boolean changed = (status.lux < 15) != (lux < 15) || status.lux < 0;
+            status.lux = lux;
+            if (changed) view.setStatus(status);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+        }
+    };
+
+    private final Runnable statusPoll = new Runnable() {
         @Override
         public void run() {
-            int level = 0;
-            try {
-                TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
-                if (tm != null && tm.getSimState() == TelephonyManager.SIM_STATE_READY) {
-                    SignalStrength ss = tm.getSignalStrength();
-                    if (ss != null) level = ss.getLevel();
-                }
-            } catch (Exception ignored) {
-            }
-            view.setSignal(level);
-            handler.postDelayed(this, 5000);
+            readStatus();
+            view.setStatus(status);
+            handler.postDelayed(this, 2000);
         }
     };
 
-    // ---------- Uygulama listesi ----------
+    @SuppressWarnings("deprecation")
+    private void readStatus() {
+        // Sinyal ve operatör
+        try {
+            TelephonyManager tm = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+            int level = 0;
+            String op = "";
+            if (tm != null && tm.getSimState() == TelephonyManager.SIM_STATE_READY) {
+                SignalStrength ss = tm.getSignalStrength();
+                if (ss != null) level = ss.getLevel();
+                op = tm.getNetworkOperatorName();
+            }
+            status.signal = level;
+            status.operator = op == null ? "" : op;
+        } catch (Exception ignored) {
+        }
+        // Wi-Fi ve mobil veri
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            Network n = cm.getActiveNetwork();
+            NetworkCapabilities nc = n == null ? null : cm.getNetworkCapabilities(n);
+            boolean wifi = nc != null && nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI);
+            status.data = nc != null && nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
+            if (wifi) {
+                int lvl = 2;
+                try {
+                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
+                    lvl = WifiManager.calculateSignalLevel(wm.getConnectionInfo().getRssi(), 3);
+                } catch (Exception ignored) {
+                }
+                status.wifi = lvl;
+            } else {
+                status.wifi = -1;
+            }
+        } catch (Exception e) {
+            status.wifi = -1;
+            status.data = false;
+        }
+        // Bluetooth
+        try {
+            BluetoothManager bm = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
+            BluetoothAdapter ad = bm == null ? null : bm.getAdapter();
+            status.bt = ad != null && ad.isEnabled();
+        } catch (Exception e) {
+            status.bt = false;
+        }
+        // Uçak modu, ses, alarm, kulaklık, konum
+        try {
+            status.airplane = Settings.Global.getInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 0) == 1;
+        } catch (Exception ignored) {
+        }
+        try {
+            AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+            int rm = am.getRingerMode();
+            status.mute = rm == AudioManager.RINGER_MODE_SILENT;
+            status.vibrate = rm == AudioManager.RINGER_MODE_VIBRATE;
+            boolean hp = false;
+            for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int t = d.getType();
+                if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET || t == AudioDeviceInfo.TYPE_WIRED_HEADPHONES
+                        || t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    hp = true;
+                }
+            }
+            status.headphones = hp;
+        } catch (Exception ignored) {
+        }
+        try {
+            AlarmManager alm = (AlarmManager) getSystemService(ALARM_SERVICE);
+            status.alarm = alm.getNextAlarmClock() != null;
+        } catch (Exception ignored) {
+        }
+        try {
+            LocationManager lm = (LocationManager) getSystemService(LOCATION_SERVICE);
+            status.location = lm.isLocationEnabled();
+        } catch (Exception ignored) {
+        }
+        // Bildirimler
+        status.notifAccess = hasNotifAccess();
+        if (status.notifAccess) {
+            status.notif = NotifService.total;
+            status.missed = NotifService.missed;
+            status.sms = NotifService.sms;
+        } else {
+            status.notif = 0;
+            status.missed = 0;
+            status.sms = 0;
+        }
+    }
+
+    private boolean hasNotifAccess() {
+        try {
+            String s = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+            return s != null && s.contains(getPackageName());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // ================= Uygulama listesi =================
 
     private static class Spec {
         final String key, label;
@@ -174,9 +301,7 @@ public class MainActivity extends Activity implements PhoneView.Host {
     private void addCategory(Spec s, String category) {
         try {
             Intent i = new Intent(Intent.ACTION_MAIN).addCategory(category);
-            for (ResolveInfo r : getPackageManager().queryIntentActivities(i, 0)) {
-                s.pkgs.add(r.activityInfo.packageName);
-            }
+            for (ResolveInfo r : getPackageManager().queryIntentActivities(i, 0)) s.pkgs.add(r.activityInfo.packageName);
         } catch (Exception ignored) {
         }
     }
@@ -199,29 +324,56 @@ public class MainActivity extends Activity implements PhoneView.Host {
         Collections.addAll(s.pkgs, pkgs);
     }
 
+    /** Hazır piksel ikonu olan popüler uygulamalar (paket adı → ikon). */
+    private static final Map<String, String> POPULAR = new HashMap<>();
+
+    static {
+        String[][] p = {
+                {"com.instagram.android", "instagram"}, {"com.facebook.katana", "facebook"}, {"com.facebook.lite", "facebook"},
+                {"com.facebook.orca", "messenger"}, {"org.telegram.messenger", "telegram"},
+                {"com.zhiliaoapp.musically", "tiktok"}, {"com.ss.android.ugc.trill", "tiktok"},
+                {"com.twitter.android", "x"}, {"com.snapchat.android", "snapchat"}, {"com.spotify.music", "spotify"},
+                {"com.netflix.mediaclient", "netflix"}, {"com.android.chrome", "chrome"},
+                {"com.google.android.googlequicksearchbox", "google"}, {"com.google.android.apps.docs", "drive"},
+                {"com.google.android.apps.photos", "photos"}, {"us.zoom.videomeetings", "zoom"},
+                {"trendyol.com", "trendyol"}, {"com.pozitron.hepsiburada", "hepsiburada"}, {"com.getir", "getir"},
+                {"com.inovel.app.yemeksepeti", "yemeksepeti"}, {"tr.gov.turkiye.edevlet.kapisi", "edevlet"},
+                {"com.ziraat.ziraatmobil", "bank"}, {"com.ykb.android", "bank"}, {"com.garanti.cepsubesi", "bank"},
+                {"com.akbank.android.apps.akbank_direkt", "bank"}, {"com.pozitron.iscep", "bank"},
+                {"com.vakifbank.mobile", "bank"}, {"com.tmobtech.halkbank", "bank"}, {"com.finansbank.mobile.cepsube", "bank"},
+                {"com.denizbank.mobildeniz", "bank"}, {"com.teb", "bank"}, {"com.ingbanktr.ingmobil", "bank"},
+                {"com.kuveytturk.mobil", "bank"}, {"finansbank.enpara", "bank"}, {"com.mobillium.papara", "bank"},
+                {"com.sec.android.daemonapp", "weather"}, {"com.google.android.apps.weather", "weather"},
+                {"com.samsung.android.app.notes", "notes"}, {"com.google.android.keep", "notes"},
+                {"com.sec.android.app.fm", "radio"}, {"com.shazam.android", "shazam"}
+        };
+        for (String[] e : p) POPULAR.put(e[0], e[1]);
+    }
+
     private void loadApps() {
         PackageManager pm = getPackageManager();
         Intent main = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
         List<ResolveInfo> ris = pm.queryIntentActivities(main, 0);
         List<AppEntry> all = new ArrayList<>();
+        Map<AppEntry, ResolveInfo> infoOf = new HashMap<>();
         for (ResolveInfo r : ris) {
-            if (r.activityInfo == null) continue;
-            if (getPackageName().equals(r.activityInfo.packageName)) continue;
+            if (r.activityInfo == null || getPackageName().equals(r.activityInfo.packageName)) continue;
             CharSequence l = r.loadLabel(pm);
-            all.add(new AppEntry(l == null ? r.activityInfo.packageName : l.toString(),
-                    new ComponentName(r.activityInfo.packageName, r.activityInfo.name)));
+            AppEntry a = new AppEntry(l == null ? r.activityInfo.packageName : l.toString(),
+                    new ComponentName(r.activityInfo.packageName, r.activityInfo.name));
+            all.add(a);
+            infoOf.put(a, r);
         }
 
-        // Ekranda görünme sırası
         Spec phone = new Spec("phone", "Telefon", "telefon", "phone", "dial", "arama");
-        Spec contacts = new Spec("contacts", "Kişiler", "kişi", "kisi", "rehber", "contact");
+        Spec contactsS = new Spec("contacts", "Kişiler", "kişi", "kisi", "rehber", "contact");
         Spec messages = new Spec("messages", "Mesajlar");
         Spec calendar = new Spec("calendar", "Takvim");
         Spec gallery = new Spec("gallery", "Galeri");
         Spec camera = new Spec("camera", "Kamera");
         Spec music = new Spec("music", "Müzik");
         Spec files = new Spec("files", "Dosyalar");
-        Spec settings = new Spec("settings", "Ayarlar");
+        Spec settings = new Spec("settings", "Sistem");
         Spec play = new Spec("playstore", "Play Store");
         Spec internet = new Spec("internet", "İnternet");
         Spec maps = new Spec("maps", "Haritalar");
@@ -231,46 +383,37 @@ public class MainActivity extends Activity implements PhoneView.Host {
         Spec whatsapp = new Spec("whatsapp", "WhatsApp");
         Spec youtube = new Spec("youtube", "YouTube");
 
-        // Telefon
         try {
-            TelecomManager tc = (TelecomManager) getSystemService(Context.TELECOM_SERVICE);
+            TelecomManager tc = (TelecomManager) getSystemService(TELECOM_SERVICE);
             if (tc != null && tc.getDefaultDialerPackage() != null) phone.pkgs.add(tc.getDefaultDialerPackage());
         } catch (Exception ignored) {
         }
         addResolve(phone, new Intent(Intent.ACTION_DIAL));
         addPkgs(phone, "com.google.android.dialer", "com.samsung.android.dialer", "com.android.dialer", "com.android.contacts");
-        // Kişiler
-        addCategory(contacts, Intent.CATEGORY_APP_CONTACTS);
-        addPkgs(contacts, "com.google.android.contacts", "com.samsung.android.app.contacts", "com.android.contacts");
-        // Mesajlar
+        addCategory(contactsS, Intent.CATEGORY_APP_CONTACTS);
+        addPkgs(contactsS, "com.google.android.contacts", "com.samsung.android.app.contacts", "com.android.contacts");
         try {
-            String sms = Telephony.Sms.getDefaultSmsPackage(this);
-            if (sms != null) messages.pkgs.add(sms);
+            String smsPkg = Telephony.Sms.getDefaultSmsPackage(this);
+            if (smsPkg != null) messages.pkgs.add(smsPkg);
         } catch (Exception ignored) {
         }
         addCategory(messages, Intent.CATEGORY_APP_MESSAGING);
         addPkgs(messages, "com.google.android.apps.messaging", "com.samsung.android.messaging", "com.android.mms");
-        // Takvim
         addCategory(calendar, Intent.CATEGORY_APP_CALENDAR);
         addPkgs(calendar, "com.google.android.calendar", "com.samsung.android.calendar", "com.android.calendar");
-        // Galeri
         addCategory(gallery, Intent.CATEGORY_APP_GALLERY);
-        addPkgs(gallery, "com.sec.android.gallery3d", "com.miui.gallery", "com.google.android.apps.photos", "com.android.gallery3d");
-        // Kamera
+        addPkgs(gallery, "com.sec.android.gallery3d", "com.miui.gallery", "com.android.gallery3d");
         addResolve(camera, new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA));
         addPkgs(camera, "com.sec.android.app.camera", "com.android.camera", "com.google.android.GoogleCamera");
-        // Müzik
         addCategory(music, Intent.CATEGORY_APP_MUSIC);
-        addPkgs(music, "com.google.android.apps.youtube.music", "com.spotify.music", "com.miui.player", "com.sec.android.app.music");
-        // Dosyalar
+        addPkgs(music, "com.google.android.apps.youtube.music", "com.miui.player", "com.sec.android.app.music");
         addCategory(files, "android.intent.category.APP_FILES");
         addPkgs(files, "com.sec.android.app.myfiles", "com.google.android.apps.nbu.files",
                 "com.mi.android.globalFileexplorer", "com.android.fileexplorer", "com.google.android.documentsui");
-        // Diğerleri
         addPkgs(settings, "com.android.settings");
         addPkgs(play, "com.android.vending");
         addCategory(internet, Intent.CATEGORY_APP_BROWSER);
-        addPkgs(internet, "com.android.chrome", "com.sec.android.app.sbrowser");
+        addPkgs(internet, "com.sec.android.app.sbrowser", "com.android.chrome");
         addCategory(maps, Intent.CATEGORY_APP_MAPS);
         addPkgs(maps, "com.google.android.apps.maps");
         addPkgs(gmail, "com.google.android.gm");
@@ -282,14 +425,21 @@ public class MainActivity extends Activity implements PhoneView.Host {
         addPkgs(whatsapp, "com.whatsapp", "com.whatsapp.w4b");
         addPkgs(youtube, "com.google.android.youtube");
 
-        Spec[] display = {phone, contacts, messages, calendar, gallery, camera, music, files, settings,
+        Set<String> phoneSet = new HashSet<>(phone.pkgs);
+        phoneSet.removeAll(contactsS.pkgs);
+        phoneSet.add("com.samsung.android.dialer");
+        phoneSet.add("com.google.android.dialer");
+        NotifService.phonePkgs = phoneSet;
+        NotifService.smsPkgs = new HashSet<>(messages.pkgs);
+
+        Spec[] display = {phone, contactsS, messages, calendar, gallery, camera, music, files, settings,
                 play, internet, maps, gmail, clock, calc, whatsapp, youtube};
-        // Önce paket adı kesin olanlar eşleşsin
-        Spec[] process = {whatsapp, youtube, play, settings, gmail, phone, contacts, messages, camera,
+        Spec[] process = {whatsapp, youtube, play, settings, gmail, phone, contactsS, messages, camera,
                 clock, calc, calendar, gallery, files, internet, maps, music};
 
-        java.util.Map<Spec, AppEntry> found = new java.util.HashMap<>();
-        Set<AppEntry> used = new java.util.HashSet<>();
+        Map<Spec, AppEntry> found = new HashMap<>();
+        Set<AppEntry> used = new HashSet<>();
+        Locale tr = new Locale("tr");
         for (Spec s : process) {
             AppEntry hit = null;
             for (String p : s.pkgs) {
@@ -298,10 +448,15 @@ public class MainActivity extends Activity implements PhoneView.Host {
                 if (cands.isEmpty()) continue;
                 hit = cands.get(0);
                 if (cands.size() > 1 && s.words.length > 0) {
+                    outer:
                     for (AppEntry a : cands) {
-                        String l = a.label.toLowerCase(new Locale("tr"));
-                        for (String w : s.words) if (l.contains(w)) { hit = a; break; }
-                        if (hit != cands.get(0)) break;
+                        String l = a.label.toLowerCase(tr);
+                        for (String w : s.words) {
+                            if (l.contains(w)) {
+                                hit = a;
+                                break outer;
+                            }
+                        }
                     }
                 }
                 break;
@@ -313,6 +468,10 @@ public class MainActivity extends Activity implements PhoneView.Host {
         }
 
         List<AppEntry> result = new ArrayList<>();
+        AppEntry mine = new AppEntry("Ayarlar", null);
+        mine.special = "settings";
+        mine.iconKey = "settings";
+        result.add(mine);
         for (Spec s : display) {
             AppEntry a = found.get(s);
             if (a != null) {
@@ -321,18 +480,81 @@ public class MainActivity extends Activity implements PhoneView.Host {
                 result.add(a);
             }
         }
-        List<AppEntry> rest = new ArrayList<>();
-        for (AppEntry a : all) if (!used.contains(a)) rest.add(a);
-        final Collator col = Collator.getInstance(new Locale("tr"));
+        final Collator col = Collator.getInstance(tr);
+        List<AppEntry> popular = new ArrayList<>(), rest = new ArrayList<>();
+        for (AppEntry a : all) {
+            if (used.contains(a)) continue;
+            String key = POPULAR.get(a.pkg());
+            if (key != null) {
+                a.iconKey = key;
+                popular.add(a);
+            } else {
+                String ck = a.component.flattenToShortString();
+                android.graphics.Bitmap b = autoIconCache.get(ck);
+                if (b == null) {
+                    try {
+                        b = IconMaker.make(infoOf.get(a).loadIcon(pm));
+                    } catch (Exception ignored) {
+                    }
+                    if (b != null) autoIconCache.put(ck, b);
+                }
+                a.autoIcon = b;
+                rest.add(a);
+            }
+        }
+        Collections.sort(popular, (x, y) -> col.compare(x.label, y.label));
         Collections.sort(rest, (x, y) -> col.compare(x.label, y.label));
+        result.addAll(popular);
         result.addAll(rest);
         view.setApps(result);
     }
 
-    // ---------- PhoneView.Host ----------
+    // ================= Rehber =================
+
+    private void loadContacts() {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return;
+        new Thread(() -> {
+            List<PhoneView.Contact> list = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            try {
+                ContentResolver cr = getContentResolver();
+                Cursor c = cr.query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                        new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                                ContactsContract.CommonDataKinds.Phone.NUMBER},
+                        null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC");
+                if (c != null) {
+                    while (c.moveToNext()) {
+                        String name = c.getString(0), num = c.getString(1);
+                        if (name == null || num == null) continue;
+                        String k = name + "|" + num.replaceAll("[^0-9]", "");
+                        if (seen.add(k)) list.add(new PhoneView.Contact(name, num));
+                    }
+                    c.close();
+                }
+            } catch (Exception ignored) {
+            }
+            contacts = list;
+        }).start();
+    }
+
+    @Override
+    public void requestContacts() {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) return;
+        if (sp.getBoolean("askedContacts", false)) return;
+        sp.edit().putBoolean("askedContacts", true).apply();
+        requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTS);
+    }
+
+    @Override
+    public List<PhoneView.Contact> contacts() {
+        return contacts;
+    }
+
+    // ================= PhoneView.Host =================
 
     @Override
     public void launch(AppEntry app) {
+        if (app.component == null) return;
         try {
             Intent i = new Intent(Intent.ACTION_MAIN);
             i.addCategory(Intent.CATEGORY_LAUNCHER);
@@ -347,8 +569,7 @@ public class MainActivity extends Activity implements PhoneView.Host {
     @Override
     public void appInfo(AppEntry app) {
         try {
-            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.fromParts("package", app.pkg(), null));
+            Intent i = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", app.pkg(), null));
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(i);
         } catch (Exception ignored) {
@@ -377,21 +598,65 @@ public class MainActivity extends Activity implements PhoneView.Host {
     }
 
     @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQ_CALL && pendingNumber != null) {
-            boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            startCall(pendingNumber, ok);
-            pendingNumber = null;
+    public void openNotifAccess() {
+        try {
+            startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+        } catch (Exception ignored) {
         }
     }
 
     @Override
-    public void tone(int key) {
-        if (toneGen == null || key < 0 || key > 11) return;
+    public void openHomeSettings() {
         try {
-            toneGen.startTone(key, 120); // TONE_DTMF_0..9, S(*), P(#) sırası tuş numaralarıyla aynı
+            startActivity(new Intent(Settings.ACTION_HOME_SETTINGS));
+        } catch (Exception e) {
+            try {
+                startActivity(new Intent(Settings.ACTION_SETTINGS));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    @Override
+    public void pickContact(int slot) {
+        pendingSlot = slot;
+        try {
+            Intent i = new Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI);
+            startActivityForResult(i, REQ_PICK);
+        } catch (Exception e) {
+            Toast.makeText(this, "Rehber açılamadı", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_PICK || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        try {
+            Cursor c = getContentResolver().query(data.getData(),
+                    new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                            ContactsContract.CommonDataKinds.Phone.NUMBER}, null, null, null);
+            if (c != null) {
+                if (c.moveToFirst() && pendingSlot >= 2) {
+                    sp.edit().putString("sd" + pendingSlot + "name", c.getString(0))
+                            .putString("sd" + pendingSlot + "num", c.getString(1)).apply();
+                }
+                c.close();
+            }
         } catch (Exception ignored) {
+        }
+        view.refreshList();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (requestCode == REQ_CALL && pendingNumber != null) {
+            startCall(pendingNumber, ok);
+            pendingNumber = null;
+        } else if (requestCode == REQ_CONTACTS && ok) {
+            loadContacts();
         }
     }
 }
